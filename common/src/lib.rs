@@ -1,4 +1,4 @@
-//! Shared protocol and TLS helpers for the QUIC HTTP tunnel.
+//! Shared protocol, identity and TLS helpers for the QUIC HTTP tunnel.
 //!
 //! Every tunneled HTTP request travels over its own QUIC bidirectional
 //! stream, opened by the server:
@@ -8,6 +8,7 @@
 //! client -> server: [u32 len][ResponseHead json][body bytes ...] FIN
 //! ```
 
+pub mod identity;
 pub mod protocol;
 pub mod tls;
 

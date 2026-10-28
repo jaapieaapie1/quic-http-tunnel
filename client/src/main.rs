@@ -1,8 +1,9 @@
 //! Tunnel client: keeps a QUIC connection to the tunnel server (trusting only
-//! the pinned server public key) and forwards every tunneled request to the
-//! configured destination.
+//! the pinned server public key, and authenticating with its own key) and
+//! forwards every tunneled request to the configured destination.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,8 @@ use futures_util::StreamExt;
 use quinn::crypto::rustls::QuicClientConfig;
 use reqwest::Url;
 use tokio::time::sleep;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+use tunnel_common::identity::{self, Identity};
 use tunnel_common::protocol::{
     RequestHead, ResponseHead, headers_from_wire, headers_to_wire, read_frame, write_frame,
 };
@@ -27,16 +29,33 @@ const UPSTREAM_ERROR: u32 = 1;
 #[command(version, about)]
 struct Args {
     /// Tunnel server QUIC address, `host:port`.
-    #[arg(long, env = "TUNNEL_SERVER")]
-    server: String,
+    #[arg(
+        long,
+        env = "TUNNEL_SERVER",
+        required_unless_present = "print_fingerprint"
+    )]
+    server: Option<String>,
 
     /// SHA-256 fingerprint (hex) of the server public key; the only key trusted.
-    #[arg(long, env = "TUNNEL_SERVER_PIN", value_parser = parse_fingerprint)]
-    server_pin: Fingerprint,
+    #[arg(long, env = "TUNNEL_SERVER_PIN", value_parser = parse_fingerprint,
+          required_unless_present = "print_fingerprint")]
+    server_pin: Option<Fingerprint>,
 
     /// Base URL requests are forwarded to, e.g. `http://127.0.0.1:3000`.
-    #[arg(long, env = "TUNNEL_DESTINATION")]
-    destination: Url,
+    #[arg(
+        long,
+        env = "TUNNEL_DESTINATION",
+        required_unless_present = "print_fingerprint"
+    )]
+    destination: Option<Url>,
+
+    /// PEM client certificate; generated together with the key if both are missing.
+    #[arg(long, env = "TUNNEL_CERT", default_value = "client.crt")]
+    cert: PathBuf,
+
+    /// PEM client private key; generated together with the certificate if both are missing.
+    #[arg(long, env = "TUNNEL_KEY", default_value = "client.key")]
+    key: PathBuf,
 
     /// Seconds to wait for the destination to respond.
     #[arg(long, env = "TUNNEL_DESTINATION_TIMEOUT", default_value_t = 30)]
@@ -55,6 +74,10 @@ struct Args {
     /// Maximum number of concurrently tunneled requests.
     #[arg(long, env = "TUNNEL_MAX_CONCURRENT", default_value_t = 1024)]
     max_concurrent: u32,
+
+    /// Print the client public key fingerprint (generating a key if needed) and exit.
+    #[arg(long)]
+    print_fingerprint: bool,
 }
 
 struct Forwarder {
@@ -77,7 +100,18 @@ async fn main() -> Result<()> {
         .expect("no other crypto provider installed");
 
     let args = Args::parse();
-    if !matches!(args.destination.scheme(), "http" | "https") {
+    let identity = identity::load_or_generate(&args.cert, &args.key, "quic-http-tunnel-client")?;
+    if args.print_fingerprint {
+        println!("{}", identity.fingerprint);
+        return Ok(());
+    }
+    info!(fingerprint = %identity.fingerprint, "client public key (pass to server as --client-pin)");
+
+    // Required by clap unless --print-fingerprint was given.
+    let server = args.server.expect("--server is required");
+    let server_pin = args.server_pin.expect("--server-pin is required");
+    let destination = args.destination.expect("--destination is required");
+    if !matches!(destination.scheme(), "http" | "https") {
         bail!("destination must be an http or https URL");
     }
 
@@ -86,25 +120,34 @@ async fn main() -> Result<()> {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(args.destination_timeout))
             .build()?,
-        destination: args.destination,
+        destination,
         max_body: args.max_body,
     });
     let quic_config = quic_client_config(
-        args.server_pin,
+        server_pin,
+        identity,
         args.max_concurrent,
         Duration::from_secs(args.idle_timeout),
     )?;
 
     let mut backoff = MIN_BACKOFF;
     loop {
-        match connect(&args.server, quic_config.clone()).await {
+        match connect(&server, quic_config.clone()).await {
             Ok(conn) => {
-                info!(server = %args.server, "tunnel connected");
-                backoff = MIN_BACKOFF;
+                info!(%server, "tunnel connected");
                 let reason = serve(conn, forwarder.clone()).await;
-                warn!("tunnel connection lost: {reason}");
+                if rejected_by_server(&reason) {
+                    // Keep backing off: retrying quickly won't change the verdict.
+                    error!(
+                        "server rejected the handshake, is this client's fingerprint \
+                         in its --client-pin? {reason}"
+                    );
+                } else {
+                    backoff = MIN_BACKOFF;
+                    warn!("tunnel connection lost: {reason}");
+                }
             }
-            Err(e) => warn!(server = %args.server, "connect failed: {e:#}"),
+            Err(e) => warn!(%server, "connect failed: {e:#}"),
         }
         info!("reconnecting in {backoff:?}");
         sleep(backoff).await;
@@ -114,10 +157,11 @@ async fn main() -> Result<()> {
 
 fn quic_client_config(
     pin: Fingerprint,
+    identity: Identity,
     max_concurrent: u32,
     idle_timeout: Duration,
 ) -> Result<quinn::ClientConfig> {
-    let tls = pinned_client_config(pin)?;
+    let tls = pinned_client_config(pin, identity)?;
     let mut config = quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls)?));
     let mut transport = quinn::TransportConfig::default();
     // Bidi streams are opened by the server, one per request.
@@ -147,6 +191,15 @@ async fn connect(server: &str, config: quinn::ClientConfig) -> Result<quinn::Con
     // Identity comes from the pinned key, so the SNI name is informational.
     let conn = endpoint.connect(addr, "quic-http-tunnel")?.await?;
     Ok(conn)
+}
+
+/// The server closed with a TLS alert. With TLS 1.3 the server checks the
+/// client certificate after the client already considers itself connected,
+/// so an unpinned client key shows up here rather than in `connect`.
+fn rejected_by_server(reason: &quinn::ConnectionError) -> bool {
+    // QUIC carries TLS alerts as transport error codes 0x100..=0x1ff.
+    matches!(reason, quinn::ConnectionError::ConnectionClosed(close)
+        if (0x100..=0x1ff).contains(&u64::from(close.error_code)))
 }
 
 /// Handles streams until the connection closes, returning the reason.

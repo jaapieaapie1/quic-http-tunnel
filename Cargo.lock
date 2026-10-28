@@ -1956,11 +1956,13 @@ dependencies = [
  "anyhow",
  "hex",
  "http",
+ "rcgen",
  "rustls",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "tracing",
  "x509-parser",
 ]
 
@@ -1974,7 +1976,6 @@ dependencies = [
  "clap",
  "futures-util",
  "quinn",
- "rcgen",
  "rustls",
  "tokio",
  "tokio-util",

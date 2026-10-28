@@ -7,22 +7,34 @@ Tunnels HTTP requests from a public server to a private destination over QUIC.
                  (public)                (private, dials out)
 ```
 
-- `server/`: accepts HTTP on `--http-listen` and QUIC on `--quic-listen`.
+- `server/`: accepts HTTP on `--http-listen` and QUIC on `--quic-listen`, the
+  latter **only** from clients whose public key is pinned with `--client-pin`.
 - `client/`: connects out to the server, trusting **only** the pinned server
   public key, and forwards each request to `--destination`.
-- `common/`: wire protocol and the public-key-pinning TLS verifier.
+- `common/`: wire protocol, key generation and the public-key-pinning TLS
+  verifiers.
 
 ## Usage
 
+Each side has its own key pair and pins the other's public key. Both
+binaries create a self-signed certificate and key on first run
+(`server.crt`/`server.key`, `client.crt`/`client.key`; change with `--cert`
+and `--key`), and `--print-fingerprint` prints the pin and exits.
+
 ```sh
-# On the server: creates server.crt/server.key on first run and prints the pin
-cargo run -p tunnel-server -- --print-fingerprint
-cargo run -p tunnel-server -- --http-listen 0.0.0.0:8080 --quic-listen 0.0.0.0:4433
+# On the server
+cargo run -p tunnel-server -- --print-fingerprint   # -> <server-fingerprint>
 
 # On the private side
+cargo run -p tunnel-client -- --print-fingerprint   # -> <client-fingerprint>
+
+# Then start both
+cargo run -p tunnel-server -- \
+  --http-listen 0.0.0.0:8080 --quic-listen 0.0.0.0:4433 \
+  --client-pin <client-fingerprint>
 cargo run -p tunnel-client -- \
   --server tunnel.example.com:4433 \
-  --server-pin <fingerprint> \
+  --server-pin <server-fingerprint> \
   --destination http://127.0.0.1:3000
 ```
 
@@ -30,13 +42,21 @@ Every flag can also be set by environment variable (`TUNNEL_*`, see `--help`).
 
 ## Trust model
 
-The client pins the SHA-256 of the server certificate's SubjectPublicKeyInfo.
-CA chain, hostname and expiry are ignored; the handshake signature is still
-verified, so only the holder of the private key can pass. Rotating the
-certificate with the same key keeps the pin valid.
+Both sides authenticate with mutual TLS, using public key pins rather than a
+CA. A pin is the SHA-256 of a certificate's SubjectPublicKeyInfo. CA chain,
+hostname and expiry are ignored, but the handshake signatures are still
+verified, so only the holder of a pinned private key can pass. Rotating a
+certificate with the same key keeps its pin valid.
 
-The server does **not** authenticate the client: anyone who can reach the QUIC
-port can connect as the tunnel client, and the newest connection takes over.
+- The client accepts only the server key given in `--server-pin`.
+- The server accepts only client keys listed in `--client-pin` (repeat the
+  flag, or separate with commas in `TUNNEL_CLIENT_PIN`). It refuses to start
+  without one. A client with any other key, or no certificate, fails the
+  handshake and never becomes the active tunnel.
+
+Pinning several client keys lets you rotate keys without downtime. All pinned
+clients are equivalent: the newest connection takes over from the previous one.
+A rejected client logs an error and keeps retrying with backoff.
 
 ## Reliability
 

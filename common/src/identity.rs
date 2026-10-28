@@ -1,26 +1,29 @@
+//! Self-signed certificate and key on disk, identified by its public key
+//! fingerprint. Used by both ends: each side pins the other's fingerprint.
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+use crate::tls::{format_fingerprint, spki_fingerprint};
 use anyhow::{Context, Result, bail};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::info;
-use tunnel_common::tls::{format_fingerprint, spki_fingerprint};
 
 pub struct Identity {
     pub certs: Vec<CertificateDer<'static>>,
     pub key: PrivateKeyDer<'static>,
-    /// Hex SHA-256 of the certificate's public key, what the client pins.
+    /// Hex SHA-256 of the certificate's public key, what the peer pins.
     pub fingerprint: String,
 }
 
-/// Loads the server certificate and key, generating a self-signed pair when
-/// neither file exists.
-pub fn load_or_generate(cert_path: &Path, key_path: &Path) -> Result<Identity> {
+/// Loads a certificate and key, generating a self-signed pair for `name`
+/// when neither file exists.
+pub fn load_or_generate(cert_path: &Path, key_path: &Path, name: &str) -> Result<Identity> {
     match (cert_path.exists(), key_path.exists()) {
         (true, true) => {}
-        (false, false) => generate(cert_path, key_path)?,
+        (false, false) => generate(cert_path, key_path, name)?,
         _ => bail!(
             "only one of {} and {} exists; provide both or neither",
             cert_path.display(),
@@ -46,8 +49,8 @@ pub fn load_or_generate(cert_path: &Path, key_path: &Path) -> Result<Identity> {
     })
 }
 
-fn generate(cert_path: &Path, key_path: &Path) -> Result<()> {
-    let generated = rcgen::generate_simple_self_signed(vec!["quic-http-tunnel".to_owned()])?;
+fn generate(cert_path: &Path, key_path: &Path, name: &str) -> Result<()> {
+    let generated = rcgen::generate_simple_self_signed(vec![name.to_owned()])?;
     fs::write(cert_path, generated.cert.pem())
         .with_context(|| format!("writing {}", cert_path.display()))?;
 
@@ -63,7 +66,7 @@ fn generate(cert_path: &Path, key_path: &Path) -> Result<()> {
     info!(
         cert = %cert_path.display(),
         key = %key_path.display(),
-        "generated new self-signed server identity"
+        "generated new self-signed identity"
     );
     Ok(())
 }

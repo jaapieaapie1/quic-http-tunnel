@@ -1,12 +1,11 @@
 //! Tunnel server: accepts public HTTP requests and forwards them over QUIC to
-//! the connected tunnel client.
+//! the connected tunnel client. Only clients whose public key is pinned with
+//! `--client-pin` can complete the QUIC handshake.
 //!
 //! Requests are buffered in full so they can be replayed. While no client is
 //! connected, or when the connection drops before a response head arrives, the
 //! request waits and is retried on the next connection, until
 //! `--request-timeout` expires (then the caller gets a 504).
-
-mod identity;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,12 +21,17 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use clap::Parser;
 use quinn::crypto::rustls::QuicServerConfig;
+use rustls::pki_types::CertificateDer;
 use tokio::sync::watch;
 use tokio::time::{Instant, sleep, timeout_at};
 use tokio_util::io::ReaderStream;
 use tracing::{debug, info, warn};
+use tunnel_common::identity::{self, Identity};
 use tunnel_common::protocol::{
     RequestHead, ResponseHead, headers_from_wire, headers_to_wire, read_frame, write_frame,
+};
+use tunnel_common::tls::{
+    Fingerprint, format_fingerprint, parse_fingerprint, pinned_server_config, spki_fingerprint,
 };
 
 /// Pause between attempts on the same connection, avoids a hot retry loop.
@@ -51,6 +55,12 @@ struct Args {
     /// PEM private key; generated together with the certificate if both are missing.
     #[arg(long, env = "TUNNEL_KEY", default_value = "server.key")]
     key: PathBuf,
+
+    /// SHA-256 fingerprint (hex) of a client public key allowed to connect.
+    /// Repeat the flag, or separate with commas, to allow several keys.
+    #[arg(long, env = "TUNNEL_CLIENT_PIN", value_parser = parse_fingerprint,
+          value_delimiter = ',', required_unless_present = "print_fingerprint")]
+    client_pin: Vec<Fingerprint>,
 
     /// Seconds a request may wait (queued and retried) for a response head.
     #[arg(long, env = "TUNNEL_REQUEST_TIMEOUT", default_value_t = 30)]
@@ -82,15 +92,20 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let identity = identity::load_or_generate(&args.cert, &args.key)?;
+    let identity = identity::load_or_generate(&args.cert, &args.key, "quic-http-tunnel")?;
     if args.print_fingerprint {
         println!("{}", identity.fingerprint);
         return Ok(());
     }
     info!(fingerprint = %identity.fingerprint, "server public key (pass to client as --server-pin)");
 
-    let endpoint = quinn::Endpoint::server(quic_server_config(identity)?, args.quic_listen)
-        .context("binding QUIC endpoint")?;
+    info!(count = args.client_pin.len(), "client keys allowed");
+
+    let endpoint = quinn::Endpoint::server(
+        quic_server_config(identity, args.client_pin)?,
+        args.quic_listen,
+    )
+    .context("binding QUIC endpoint")?;
     info!(addr = %args.quic_listen, "QUIC listening");
 
     let (conn_tx, conn_rx) = watch::channel(None);
@@ -114,14 +129,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn quic_server_config(identity: identity::Identity) -> Result<quinn::ServerConfig> {
-    let mut tls =
-        rustls::ServerConfig::builder_with_provider(tunnel_common::tls::crypto_provider())
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_no_client_auth()
-            .with_single_cert(identity.certs, identity.key)?;
-    tls.alpn_protocols = vec![tunnel_common::ALPN.to_vec()];
-
+fn quic_server_config(
+    identity: Identity,
+    client_pins: Vec<Fingerprint>,
+) -> Result<quinn::ServerConfig> {
+    let tls = pinned_server_config(identity, client_pins)?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls)?));
     let transport = Arc::get_mut(&mut config.transport).expect("fresh transport config");
     // Only the server opens streams.
@@ -131,7 +143,8 @@ fn quic_server_config(identity: identity::Identity) -> Result<quinn::ServerConfi
     Ok(config)
 }
 
-/// Accepts tunnel clients. The newest connection replaces any previous one.
+/// Accepts tunnel clients. Unpinned clients fail the handshake; among pinned
+/// ones, the newest connection replaces any previous one.
 async fn accept_tunnels(
     endpoint: quinn::Endpoint,
     conn_tx: watch::Sender<Option<quinn::Connection>>,
@@ -148,7 +161,8 @@ async fn accept_tunnels(
                     return;
                 }
             };
-            info!(%remote, id = conn.stable_id(), "tunnel client connected");
+            let client = client_fingerprint(&conn).unwrap_or_else(|| "unknown".to_owned());
+            info!(%remote, id = conn.stable_id(), %client, "tunnel client connected");
             if let Some(old) = conn_tx.send_replace(Some(conn.clone())) {
                 old.close(0u32.into(), b"replaced by newer connection");
             }
@@ -166,6 +180,16 @@ async fn accept_tunnels(
             });
         });
     }
+}
+
+/// Hex fingerprint of the key the client authenticated with.
+fn client_fingerprint(conn: &quinn::Connection) -> Option<String> {
+    let certs = conn
+        .peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()?;
+    let fp = spki_fingerprint(certs.first()?).ok()?;
+    Some(format_fingerprint(&fp))
 }
 
 async fn proxy(
