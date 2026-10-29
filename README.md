@@ -40,6 +40,27 @@ cargo run -p tunnel-client -- \
 
 Every flag can also be set by environment variable (`TUNNEL_*`, see `--help`).
 
+### Windows service
+
+Building the client with the `windows-service` feature adds a `--service`
+flag that runs it under the Service Control Manager:
+
+```sh
+cargo build --release -p tunnel-client --target x86_64-pc-windows-gnu --features windows-service
+```
+
+Pass the configuration on the service's command line, as admin:
+
+```bat
+sc.exe create tunnel-client start= auto binPath= "C:\tunnel\tunnel-client.exe --service --server tunnel.example.com:4433 --server-pin <server-fingerprint> --destination http://127.0.0.1:3000"
+sc.exe start tunnel-client
+```
+
+In service mode the working directory is the executable's directory, so the
+default `client.crt`/`client.key` live next to it, and logs are appended to
+`tunnel-client.log` there. Run `--print-fingerprint` once from that directory
+to create the key and get the pin before starting the service.
+
 ## Trust model
 
 Both sides authenticate with mutual TLS, using public key pins rather than a

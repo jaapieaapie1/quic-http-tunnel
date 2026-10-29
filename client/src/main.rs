@@ -2,6 +2,9 @@
 //! the pinned server public key, and authenticating with its own key) and
 //! forwards every tunneled request to the configured destination.
 
+#[cfg(all(windows, feature = "windows-service"))]
+mod service;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -78,6 +81,13 @@ struct Args {
     /// Print the client public key fingerprint (generating a key if needed) and exit.
     #[arg(long)]
     print_fingerprint: bool,
+
+    /// Run under the Windows Service Control Manager. Relative paths resolve
+    /// against the executable's directory, and logs go to `tunnel-client.log`
+    /// there.
+    #[cfg(all(windows, feature = "windows-service"))]
+    #[arg(long)]
+    service: bool,
 }
 
 struct Forwarder {
@@ -86,20 +96,30 @@ struct Forwarder {
     max_body: usize,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+fn main() -> Result<()> {
+    let args = Args::parse();
+    #[cfg(all(windows, feature = "windows-service"))]
+    if args.service {
+        return service::start(args);
+    }
 
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter())
+        .init();
+    tokio::runtime::Runtime::new()?.block_on(run(args, std::future::pending()))
+}
+
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into())
+}
+
+/// Runs the tunnel until it fails or `shutdown` completes.
+async fn run(args: Args, shutdown: impl Future<Output = ()>) -> Result<()> {
     // reqwest is built without a bundled provider; use ring like the tunnel.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("no other crypto provider installed");
 
-    let args = Args::parse();
     let identity = identity::load_or_generate(&args.cert, &args.key, "quic-http-tunnel-client")?;
     if args.print_fingerprint {
         println!("{}", identity.fingerprint);
@@ -130,9 +150,24 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.idle_timeout),
     )?;
 
+    tokio::select! {
+        () = shutdown => {
+            info!("shutting down");
+            Ok(())
+        }
+        never = tunnel(&server, quic_config, forwarder) => match never {},
+    }
+}
+
+/// Keeps a tunnel connection up, reconnecting with backoff. Never returns.
+async fn tunnel(
+    server: &str,
+    quic_config: quinn::ClientConfig,
+    forwarder: Arc<Forwarder>,
+) -> std::convert::Infallible {
     let mut backoff = MIN_BACKOFF;
     loop {
-        match connect(&server, quic_config.clone()).await {
+        match connect(server, quic_config.clone()).await {
             Ok(conn) => {
                 info!(%server, "tunnel connected");
                 let reason = serve(conn, forwarder.clone()).await;
