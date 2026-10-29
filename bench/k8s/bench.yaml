@@ -1,0 +1,161 @@
+# Benchmark topology, one pod per node so all traffic crosses the network:
+#   load ──TCP──► server ══QUIC══► client ──TCP──► destination
+# Images are stock Debian with CA certificates (the client needs system
+# roots even for an http destination); run.sh copies the binaries in and then touches
+# /opt/bench/ready, which the containers wait for before starting. run.sh
+# also creates the namespace and the tunnel-bench-keys secret. The soft
+# open-file limit is 1024, raised to the hard limit so it isn't the bottleneck.
+apiVersion: v1
+kind: Service
+metadata:
+  name: server
+  namespace: tunnel-bench
+spec:
+  selector: {app: server}
+  ports:
+    - {name: http, port: 8080, protocol: TCP}
+    - {name: quic, port: 4433, protocol: UDP}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: destination
+  namespace: tunnel-bench
+spec:
+  selector: {app: destination}
+  ports:
+    - {name: http, port: 3000, protocol: TCP}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: tunnel-bench
+  labels: {app: server, part-of: tunnel-bench}
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector: {matchLabels: {part-of: tunnel-bench}}
+  containers:
+    - name: server
+      image: buildpack-deps:bookworm-curl
+      command: [sh, -c]
+      args:
+        - until [ -f /opt/bench/ready ]; do sleep 1; done; ulimit -n "$(ulimit -Hn)";
+          exec /opt/bench/tunnel-server --http-listen 0.0.0.0:8080 --quic-listen 0.0.0.0:4433
+          --cert /keys/server.crt --key /keys/server.key --client-pin "$CLIENT_PIN"
+      env:
+        - name: CLIENT_PIN
+          valueFrom: {secretKeyRef: {name: tunnel-bench-keys, key: client.pin}}
+        - {name: RUST_LOG, value: warn}
+      resources:
+        requests: {cpu: "1", memory: 256Mi}
+        limits: {cpu: "2", memory: 2Gi}
+      volumeMounts:
+        - {name: bin, mountPath: /opt/bench}
+        - {name: keys, mountPath: /keys, readOnly: true}
+  volumes:
+    - name: bin
+      emptyDir: {}
+    - name: keys
+      secret: {secretName: tunnel-bench-keys}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client
+  namespace: tunnel-bench
+  labels: {app: client, part-of: tunnel-bench}
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector: {matchLabels: {part-of: tunnel-bench}}
+  containers:
+    - name: client
+      image: buildpack-deps:bookworm-curl
+      command: [sh, -c]
+      args:
+        - until [ -f /opt/bench/ready ]; do sleep 1; done; ulimit -n "$(ulimit -Hn)";
+          exec /opt/bench/tunnel-client --server server:4433 --destination http://destination:3000
+          --cert /keys/client.crt --key /keys/client.key --server-pin "$SERVER_PIN"
+      env:
+        - name: SERVER_PIN
+          valueFrom: {secretKeyRef: {name: tunnel-bench-keys, key: server.pin}}
+        # Set by run.sh from MAX_CONCURRENT and MAX_CONNECTIONS.
+        - {name: TUNNEL_MAX_CONCURRENT, value: "__MAX_CONCURRENT__"}
+        - {name: TUNNEL_MAX_CONNECTIONS, value: "__MAX_CONNECTIONS__"}
+        - {name: RUST_LOG, value: "warn,tunnel_client=info"}
+      resources:
+        requests: {cpu: "1", memory: 256Mi}
+        limits: {cpu: "2", memory: 2Gi}
+      volumeMounts:
+        - {name: bin, mountPath: /opt/bench}
+        - {name: keys, mountPath: /keys, readOnly: true}
+  volumes:
+    - name: bin
+      emptyDir: {}
+    - name: keys
+      secret: {secretName: tunnel-bench-keys}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: destination
+  namespace: tunnel-bench
+  labels: {app: destination, part-of: tunnel-bench}
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector: {matchLabels: {part-of: tunnel-bench}}
+  containers:
+    - name: destination
+      image: buildpack-deps:bookworm-curl
+      command: [sh, -c]
+      args:
+        - until [ -f /opt/bench/ready ]; do sleep 1; done; ulimit -n "$(ulimit -Hn)";
+          exec /opt/bench/tunnel-bench destination --listen 0.0.0.0:3000
+      resources:
+        requests: {cpu: "1", memory: 256Mi}
+        limits: {cpu: "2", memory: 2Gi}
+      volumeMounts:
+        - {name: bin, mountPath: /opt/bench}
+        - {name: keys, mountPath: /keys, readOnly: true}
+  volumes:
+    - name: bin
+      emptyDir: {}
+    - name: keys
+      secret: {secretName: tunnel-bench-keys}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: load
+  namespace: tunnel-bench
+  labels: {app: load, part-of: tunnel-bench}
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - topologyKey: kubernetes.io/hostname
+          labelSelector: {matchLabels: {part-of: tunnel-bench}}
+  containers:
+    - name: load
+      image: buildpack-deps:bookworm-curl
+      command: [sleep, infinity]
+      resources:
+        requests: {cpu: "1", memory: 256Mi}
+        limits: {cpu: "2", memory: 2Gi}
+      volumeMounts:
+        - {name: bin, mountPath: /opt/bench}
+        - {name: keys, mountPath: /keys, readOnly: true}
+  volumes:
+    - name: bin
+      emptyDir: {}
+    - name: keys
+      secret: {secretName: tunnel-bench-keys}

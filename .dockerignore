@@ -1,0 +1,5 @@
+target
+*.crt
+*.key
+.git
+generated-images

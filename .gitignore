@@ -3,3 +3,4 @@ server.key
 server.crt
 client.key
 client.crt
+.DS_STORE

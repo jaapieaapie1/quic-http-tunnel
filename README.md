@@ -84,6 +84,28 @@ Pinning several client keys lets you rotate keys without downtime. All pinned
 clients are equivalent: the newest connection takes over from the previous one.
 A rejected client logs an error and keeps retrying with backoff.
 
+## Multiple connections
+
+By default the client uses one QUIC connection, which carries up to
+`--max-concurrent` (default 1024) requests at once; further requests queue on
+the server. Processing for a single connection also runs on roughly one core.
+With `--max-connections N` the client opens another connection whenever
+requests in flight reach 75% of `--max-concurrent` per open connection, up to
+`N`. The server sends each request to the connection with the fewest requests
+in flight. Extra connections stay open until they are lost, and are opened
+again when load needs them.
+
+All connections of one client run belong to one session. The client sends the
+session id in the TLS server name (SNI), which the pinned verifiers otherwise
+ignore: `<id>.new.quic-http-tunnel` starts a session and replaces all
+connections of the previous one, as a single connection always did, and
+`<id>.join.quic-http-tunnel` adds a connection to the current session. The
+server rejects a join to any other session. Clients that send the old plain
+`quic-http-tunnel` name each start a session of their own.
+
+Update the server before using `--max-connections` above 1: an older server
+treats every extra connection as a replacement.
+
 ## Reliability
 
 - The client reconnects with exponential backoff (0.5s up to 10s). A dead

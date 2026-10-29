@@ -1,6 +1,9 @@
 //! Tunnel client: keeps a QUIC connection to the tunnel server (trusting only
 //! the pinned server public key, and authenticating with its own key) and
 //! forwards every tunneled request to the configured destination.
+//!
+//! With `--max-connections` above 1 it opens extra connections in the same
+//! session (see `tunnel_common::session`) while the open ones are busy.
 
 #[cfg(all(windows, feature = "windows-service"))]
 mod service;
@@ -8,6 +11,7 @@ mod service;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -21,6 +25,7 @@ use tunnel_common::identity::{self, Identity};
 use tunnel_common::protocol::{
     RequestHead, ResponseHead, headers_from_wire, headers_to_wire, read_frame, write_frame,
 };
+use tunnel_common::session::{self, CountGuard, Role, SessionId};
 use tunnel_common::tls::{Fingerprint, parse_fingerprint, pinned_client_config};
 
 const MIN_BACKOFF: Duration = Duration::from_millis(500);
@@ -77,6 +82,13 @@ struct Args {
     /// Maximum number of concurrently tunneled requests.
     #[arg(long, env = "TUNNEL_MAX_CONCURRENT", default_value_t = 1024)]
     max_concurrent: u32,
+
+    /// Maximum number of QUIC connections to the server. Another one is
+    /// opened while requests in flight exceed 75% of `--max-concurrent` per
+    /// open connection; it stays open until the connection is lost.
+    #[arg(long, env = "TUNNEL_MAX_CONNECTIONS", default_value_t = 1,
+          value_parser = clap::value_parser!(u32).range(1..))]
+    max_connections: u32,
 
     /// Print the client public key fingerprint (generating a key if needed) and exit.
     #[arg(long)]
@@ -159,44 +171,164 @@ async fn run(args: Args, shutdown: impl Future<Output = ()>) -> Result<()> {
         args.max_concurrent,
         Duration::from_secs(args.idle_timeout),
     )?;
+    let tunnel = Arc::new(Tunnel {
+        server,
+        quic_config,
+        forwarder,
+        max_connections: args.max_connections as usize,
+        scale_at: (args.max_concurrent as usize * 3 / 4).max(1),
+        session: AtomicU64::new(0),
+        live: Arc::default(),
+        in_flight: Arc::default(),
+        scaling: AtomicBool::new(false),
+    });
 
     tokio::select! {
         () = shutdown => {
             info!("shutting down");
             Ok(())
         }
-        never = tunnel(&server, quic_config, forwarder) => match never {},
+        never = tunnel.run() => match never {},
     }
 }
 
-/// Keeps a tunnel connection up, reconnecting with backoff. Never returns.
-async fn tunnel(
-    server: &str,
+/// The client's connections to the server, all in one session.
+struct Tunnel {
+    server: String,
     quic_config: quinn::ClientConfig,
     forwarder: Arc<Forwarder>,
-) -> std::convert::Infallible {
-    let mut backoff = MIN_BACKOFF;
-    loop {
-        match connect(server, quic_config.clone()).await {
-            Ok(conn) => {
-                info!(%server, "tunnel connected");
-                let reason = serve(conn, forwarder.clone()).await;
-                if rejected_by_server(&reason) {
-                    // Keep backing off: retrying quickly won't change the verdict.
-                    error!(
-                        "server rejected the handshake, is this client's fingerprint \
+    max_connections: usize,
+    /// Requests in flight per open connection before another is opened.
+    scale_at: usize,
+    session: AtomicU64,
+    /// Open connections.
+    live: Arc<AtomicUsize>,
+    /// Requests being handled, over all connections.
+    in_flight: Arc<AtomicUsize>,
+    /// Whether an extra connection is being opened.
+    scaling: AtomicBool,
+}
+
+impl Tunnel {
+    /// Keeps a tunnel connection up, reconnecting with backoff. Never returns.
+    async fn run(self: &Arc<Self>) -> std::convert::Infallible {
+        let server = &self.server;
+        let mut backoff = MIN_BACKOFF;
+        loop {
+            // With extra connections still open, rejoin their session instead of
+            // replacing it.
+            let role = if self.live.load(Ordering::Relaxed) > 0 {
+                Role::Join
+            } else {
+                self.session.store(SessionId::random().0, Ordering::Relaxed);
+                Role::New
+            };
+            match self.connect(role).await {
+                Ok(conn) => {
+                    info!(%server, session = %self.session(), ?role, "tunnel connected");
+                    let live = CountGuard::new(&self.live);
+                    let reason = self.serve(conn, live).await;
+                    if rejected_by_server(&reason) {
+                        // Keep backing off: retrying quickly won't change the verdict.
+                        error!(
+                            "server rejected the handshake, is this client's fingerprint \
                          in its --client-pin? {reason}"
+                        );
+                    } else {
+                        backoff = MIN_BACKOFF;
+                        warn!("tunnel connection lost: {reason}");
+                    }
+                }
+                Err(e) => warn!(%server, "connect failed: {e:#}"),
+            }
+            info!("reconnecting in {backoff:?}");
+            sleep(backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }
+
+    fn session(&self) -> SessionId {
+        SessionId(self.session.load(Ordering::Relaxed))
+    }
+
+    /// Opens another connection in the current session if all open ones are
+    /// busy and the limit allows it. At most one is opened at a time.
+    fn maybe_scale(self: &Arc<Self>) {
+        let live = self.live.load(Ordering::Relaxed);
+        if live == 0
+            || live >= self.max_connections
+            || self.in_flight.load(Ordering::Relaxed) < live * self.scale_at
+            || self.scaling.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let tunnel = self.clone();
+        tokio::spawn(async move {
+            match tunnel.connect(Role::Join).await {
+                Ok(conn) => {
+                    let live = CountGuard::new(&tunnel.live);
+                    tunnel.scaling.store(false, Ordering::Relaxed);
+                    info!(
+                        connections = tunnel.live.load(Ordering::Relaxed),
+                        "opened extra connection"
                     );
-                } else {
-                    backoff = MIN_BACKOFF;
-                    warn!("tunnel connection lost: {reason}");
+                    let reason = tunnel.serve(conn, live).await;
+                    info!("extra connection closed: {reason}");
+                }
+                Err(e) => {
+                    warn!("opening extra connection failed: {e:#}");
+                    // Don't retry on every request while the server is unreachable.
+                    sleep(MIN_BACKOFF).await;
+                    tunnel.scaling.store(false, Ordering::Relaxed);
                 }
             }
-            Err(e) => warn!(%server, "connect failed: {e:#}"),
+        });
+    }
+
+    async fn connect(&self, role: Role) -> Result<quinn::Connection> {
+        let server = &self.server;
+        let addr = tokio::net::lookup_host(server)
+            .await
+            .with_context(|| format!("resolving {server}"))?
+            .next()
+            .with_context(|| format!("no address for {server}"))?;
+        let bind: SocketAddr = if addr.is_ipv6() {
+            "[::]:0".parse()?
+        } else {
+            "0.0.0.0:0".parse()?
+        };
+        let mut endpoint = quinn::Endpoint::client(bind)?;
+        endpoint.set_default_client_config(self.quic_config.clone());
+        // Identity comes from the pinned key; the server name carries the session.
+        let name = session::server_name(self.session(), role);
+        let conn = endpoint.connect(addr, &name)?.await?;
+        Ok(conn)
+    }
+
+    /// Handles streams until the connection closes, returning the reason. `live`
+    /// counts the connection as open until then.
+    async fn serve(
+        self: &Arc<Self>,
+        conn: quinn::Connection,
+        live: CountGuard,
+    ) -> quinn::ConnectionError {
+        let _live = live;
+        loop {
+            match conn.accept_bi().await {
+                Ok((send, recv)) => {
+                    let in_flight = CountGuard::new(&self.in_flight);
+                    self.maybe_scale();
+                    let forwarder = self.forwarder.clone();
+                    tokio::spawn(async move {
+                        let _in_flight = in_flight;
+                        if let Err(e) = forwarder.handle(send, recv).await {
+                            warn!("request failed: {e:#}");
+                        }
+                    });
+                }
+                Err(e) => return e,
+            }
         }
-        info!("reconnecting in {backoff:?}");
-        sleep(backoff).await;
-        backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
 
@@ -220,24 +352,6 @@ fn quic_client_config(
     Ok(config)
 }
 
-async fn connect(server: &str, config: quinn::ClientConfig) -> Result<quinn::Connection> {
-    let addr = tokio::net::lookup_host(server)
-        .await
-        .with_context(|| format!("resolving {server}"))?
-        .next()
-        .with_context(|| format!("no address for {server}"))?;
-    let bind: SocketAddr = if addr.is_ipv6() {
-        "[::]:0".parse()?
-    } else {
-        "0.0.0.0:0".parse()?
-    };
-    let mut endpoint = quinn::Endpoint::client(bind)?;
-    endpoint.set_default_client_config(config);
-    // Identity comes from the pinned key, so the SNI name is informational.
-    let conn = endpoint.connect(addr, "quic-http-tunnel")?.await?;
-    Ok(conn)
-}
-
 /// The server closed with a TLS alert. With TLS 1.3 the server checks the
 /// client certificate after the client already considers itself connected,
 /// so an unpinned client key shows up here rather than in `connect`.
@@ -245,23 +359,6 @@ fn rejected_by_server(reason: &quinn::ConnectionError) -> bool {
     // QUIC carries TLS alerts as transport error codes 0x100..=0x1ff.
     matches!(reason, quinn::ConnectionError::ConnectionClosed(close)
         if (0x100..=0x1ff).contains(&u64::from(close.error_code)))
-}
-
-/// Handles streams until the connection closes, returning the reason.
-async fn serve(conn: quinn::Connection, forwarder: Arc<Forwarder>) -> quinn::ConnectionError {
-    loop {
-        match conn.accept_bi().await {
-            Ok((send, recv)) => {
-                let forwarder = forwarder.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = forwarder.handle(send, recv).await {
-                        warn!("request failed: {e:#}");
-                    }
-                });
-            }
-            Err(e) => return e,
-        }
-    }
 }
 
 impl Forwarder {

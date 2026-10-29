@@ -10,6 +10,7 @@
 
 pub mod identity;
 pub mod protocol;
+pub mod session;
 pub mod tls;
 
 /// ALPN identifier negotiated on the QUIC connection.
