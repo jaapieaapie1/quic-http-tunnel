@@ -49,12 +49,17 @@ flag that runs it under the Service Control Manager:
 cargo build --release -p tunnel-client --target x86_64-pc-windows-gnu --features windows-service
 ```
 
-Pass the configuration on the service's command line, as admin:
+Install it with `--install` and the flags the service should run with, as admin:
 
 ```bat
-sc.exe create tunnel-client start= auto binPath= "C:\tunnel\tunnel-client.exe --service --server tunnel.example.com:4433 --server-pin <server-fingerprint> --destination http://127.0.0.1:3000"
+tunnel-client.exe --install --server tunnel.example.com:4433 --server-pin <server-fingerprint> --destination http://127.0.0.1:3000
 sc.exe start tunnel-client
 ```
+
+This registers an auto-start `tunnel-client` service running as LocalSystem,
+launched as `tunnel-client.exe --service` plus the given flags. Only flags
+are carried over, not `TUNNEL_*` environment variables. To change the flags,
+remove it with `sc.exe delete tunnel-client` and install again.
 
 In service mode the working directory is the executable's directory, so the
 default `client.crt`/`client.key` live next to it, and logs are appended to

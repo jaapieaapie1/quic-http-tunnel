@@ -9,14 +9,17 @@ use anyhow::{Context, Result};
 use tokio::sync::Notify;
 use tracing::error;
 use windows_service::service::{
-    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use crate::Args;
 
-/// Ignored by the SCM for an own-process service; any name works.
+/// Name `install` registers. The SCM ignores it when dispatching an
+/// own-process service, so a service installed by hand under another name works too.
 const SERVICE_NAME: &str = "tunnel-client";
 const LOG_FILE: &str = "tunnel-client.log";
 
@@ -24,6 +27,40 @@ const LOG_FILE: &str = "tunnel-client.log";
 static ARGS: Mutex<Option<Args>> = Mutex::new(None);
 
 define_windows_service!(ffi_service_main, service_main);
+
+/// Registers this executable as an auto-start service, launched with
+/// `--service` and the same flags as this invocation minus `--install`.
+pub fn install() -> Result<()> {
+    let mut launch_arguments = vec![OsString::from("--service")];
+    launch_arguments.extend(std::env::args_os().skip(1).filter(|arg| arg != "--install"));
+
+    let manager = ServiceManager::local_computer(
+        None::<&str>,
+        ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+    )
+    .context("opening the service control manager, is this running as administrator?")?;
+    let service = manager
+        .create_service(
+            &ServiceInfo {
+                name: SERVICE_NAME.into(),
+                display_name: "QUIC HTTP tunnel client".into(),
+                service_type: ServiceType::OWN_PROCESS,
+                start_type: ServiceStartType::AutoStart,
+                error_control: ServiceErrorControl::Normal,
+                executable_path: std::env::current_exe()?,
+                launch_arguments,
+                dependencies: vec![],
+                account_name: None, // LocalSystem
+                account_password: None,
+            },
+            ServiceAccess::CHANGE_CONFIG,
+        )
+        .with_context(|| format!("creating service {SERVICE_NAME}"))?;
+    service
+        .set_description("Forwards requests from the tunnel server to the local destination.")?;
+    println!("installed service {SERVICE_NAME}; start it with: sc.exe start {SERVICE_NAME}");
+    Ok(())
+}
 
 /// Connects to the SCM and blocks until the service stops.
 pub fn start(args: Args) -> Result<()> {

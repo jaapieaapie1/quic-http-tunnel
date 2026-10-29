@@ -88,6 +88,12 @@ struct Args {
     #[cfg(all(windows, feature = "windows-service"))]
     #[arg(long)]
     service: bool,
+
+    /// Install as an auto-start Windows service that runs with `--service`
+    /// and the other flags given here, then exit. Needs administrator rights.
+    #[cfg(all(windows, feature = "windows-service"))]
+    #[arg(long, conflicts_with_all = ["service", "print_fingerprint"])]
+    install: bool,
 }
 
 struct Forwarder {
@@ -98,6 +104,10 @@ struct Forwarder {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(all(windows, feature = "windows-service"))]
+    if args.install {
+        return service::install();
+    }
     #[cfg(all(windows, feature = "windows-service"))]
     if args.service {
         return service::start(args);
